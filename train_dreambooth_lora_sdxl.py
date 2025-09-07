@@ -308,6 +308,18 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--local_config_file_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
+        "--local_config_text_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
         "--dataset_config_name",
         type=str,
         default=None,
@@ -801,13 +813,29 @@ class DreamBoothDataset(Dataset):
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
                 raise ValueError("Instance images root doesn't exists.")
-
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
-            self.custom_instance_prompts = None
+            if args.local_config_file_name == None:
+                instance_files = [f for f in os.listdir(self.instance_data_root) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+                self.custom_instance_prompts = None
+            else:
+                config_path = self.instance_data_root / 'metadata.jsonl'
+                instance_files = []
+                self.custom_instance_prompts = []
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        #TODO
+                        line = line.strip()
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        instance_files.append(data[args.local_config_file_name])
+                        self.custom_instance_prompts.append(data[args.local_config_text_name])
+                # print(f'///////////{instance_files}\n??????????{self.custom_instance_prompts}')
+            instance_images = [Image.open(os.path.join(self.instance_data_root, path)) for path in instance_files]
 
         self.instance_images = []
-        for img in instance_images:
-            self.instance_images.extend(itertools.repeat(img, repeats))
+        if args.image_column != None:
+            for img in instance_images:
+                self.instance_images.extend(itertools.repeat(img, repeats))
         self.bucket = []
         if args.bucket_size:
             for size in args.bucket_size.split(','):
@@ -817,6 +845,7 @@ class DreamBoothDataset(Dataset):
             self.bucket.append((str(args.resolution), str(args.resolution)))
 
         # image processing to prepare for using SD-XL micro-conditioning
+        self.file_name = []
         self.original_sizes = []
         self.crop_top_lefts = []
         self.pixel_values = []
@@ -827,7 +856,7 @@ class DreamBoothDataset(Dataset):
             raise ValueError(f"Unsupported interpolation mode {interpolation=}.")
         # train_resize = transforms.Resize(size, interpolation=interpolation)
         # train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        train_flip = transforms.RandomHorizontalFlip(p=1.0)
+        self.train_flip = transforms.RandomHorizontalFlip(p=1.0)
         self.train_transforms = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -835,7 +864,7 @@ class DreamBoothDataset(Dataset):
             ]
         )
         # per_pic_best_ratio = []
-        for image in self.instance_images:
+        for image_index , image in enumerate(self.instance_images):
             image = exif_transpose(image)
             if not image.mode == "RGB":
                 image = image.convert("RGB")
@@ -860,7 +889,7 @@ class DreamBoothDataset(Dataset):
             # image = train_resize(image)
             if args.random_flip and random.random() < 0.5:
                 # flip
-                image = train_flip(image)
+                image = self.train_flip(image)
             if args.center_crop:
                 # y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
                 # x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
@@ -879,6 +908,7 @@ class DreamBoothDataset(Dataset):
             img_t = self.train_transforms(image)
             self.pixel_values.append(img_t)
             self.bucker_index.append(bucket_index)
+            self.file_name.append(instance_files[image_index])
 
         self.num_instance_images = len(self.instance_images)
         self._length = self.num_instance_images
@@ -951,7 +981,8 @@ class DreamBoothDataset(Dataset):
                 example["instance_prompt"] = caption
             else:
                 example["instance_prompt"] = self.instance_prompt
-
+        elif args.local_config_file_name!=None and args.local_config_text_name!=None:
+            example["instance_prompt"] = self.custom_instance_prompts[index % self.num_instance_images]
         else:  # custom prompts were provided, but length does not match size of image dataset
             example["instance_prompt"] = self.instance_prompt
 
@@ -964,9 +995,11 @@ class DreamBoothDataset(Dataset):
             cls_path = random.choice(bucket_images)
             # cls_path = self.class_images_by_bucket[random_bucket_index][index % len(self.class_images_by_bucket[random_bucket_index])]
             class_image = Image.open(cls_path)
+            if args.random_flip and random.random() < 0.5:
+                class_image = self.train_flip(class_image)
             cls_original_size = (class_image.height, class_image.width)
             example["class_original_size"] =cls_original_size
-            class_image = exif_transpose(class_image)        
+            class_image = exif_transpose(class_image)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             target_h, target_w = target_size
@@ -990,7 +1023,7 @@ class DreamBoothDataset(Dataset):
             #     class_image = class_image.convert("RGB")
             # example["class_images"] = self.image_transforms(class_image)
             example["class_prompt"] = self.class_prompt
-
+            # print(f'check pick item：{example["instance_prompt"]},\n file_name  in {self.file_name[index % self.num_instance_images]}')
         return example
 
 
@@ -1013,7 +1046,6 @@ def collate_fn(examples, with_prior_preservation=False):
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
     batch = {
         "pixel_values": pixel_values,
         "prompts": prompts,
@@ -1614,7 +1646,7 @@ def main(args):
     def compute_time_ids(original_size, crops_coords_top_left, target_size, bucket_index):
         # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
         # target_size = (args.resolution, args.resolution)
-        print(f'当前图形size:{target_size}, 在桶:{bucket_index}')
+        # print(f'当前图形size:{target_size}, 在桶:{bucket_index}')
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
         add_time_ids = torch.tensor([add_time_ids])
         add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
@@ -1806,10 +1838,12 @@ def main(args):
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 prompts = batch["prompts"]
-
+                # print(f'???????{prompts}')
                 # encode batch prompts when custom prompts are provided for each image
                 if train_dataset.custom_instance_prompts:
+                    # print('进行分别计算每个embed')
                     if not args.train_text_encoder:
+                        
                         prompt_embeds, unet_add_text_embeds = compute_text_embeddings(
                             prompts, text_encoders, tokenizers
                         )
@@ -1871,12 +1905,14 @@ def main(args):
                 # Calculate the elements to repeat depending on the use of prior-preservation and custom captions.
                 if not train_dataset.custom_instance_prompts:
                     elems_to_repeat_text_embeds = bsz // 2 if args.with_prior_preservation else bsz
+                    # elems_to_repeat_text_embeds = bsz
                 else:
                     elems_to_repeat_text_embeds = 1
 
                 # Predict the noise residual
                 if not args.train_text_encoder:
-                    if add_time_ids.shape[0] == 1:
+                    # print(f'init_embed:{unet_add_text_embeds.shape}, times:{elems_to_repeat_text_embeds}')
+                    if elems_to_repeat_text_embeds == 1:
                         double_add_time_ids = add_time_ids.repeat_interleave(2, dim=0)
                     else:
                         double_add_time_ids = add_time_ids.repeat_interleave(elems_to_repeat_text_embeds, dim=0)
@@ -1888,7 +1924,6 @@ def main(args):
                     prompt_embeds_input = prompt_embeds.repeat_interleave(elems_to_repeat_text_embeds, dim=0)
                     # print(f"1111Shape of add_time_ids: {add_time_ids.shape}")
                     # print(f"1111Shape of unet_add_text_embeds (pooled): {unet_added_conditions['text_embeds'].shape}")
-
                     # print(f"提示词输入向量:{prompt_embeds_input.shape}, 他第一维度应该为:{elems_to_repeat_text_embeds}, 其他应为：{prompt_embeds.shape}")
                     model_pred = unet(
                         inp_noisy_latents if args.do_edm_style_training else noisy_model_input,
@@ -1918,10 +1953,7 @@ def main(args):
                         {"text_embeds": pooled_prompt_embeds.repeat_interleave(elems_to_repeat_text_embeds, dim=0)}
                     )
                     prompt_embeds_input = prompt_embeds.repeat_interleave(elems_to_repeat_text_embeds, dim=0)
-                    # print(f"2222Shape of add_time_ids: {add_time_ids.shape}")
-                    # print(f"2222Shape of unet_add_text_embeds (pooled): {unet_added_conditions['text_embeds'].shape}")
-                    # print(f"提示词输入向量:{prompt_embeds_input.shape}, 他第一维度应该为:{elems_to_repeat_text_embeds}, 其他应为：{prompt_embeds.shape}")
-                    # prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat_text_embeds, 1, 1)
+                    prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat_text_embeds, 1, 1)
                     model_pred = unet(
                         inp_noisy_latents if args.do_edm_style_training else noisy_model_input,
                         timesteps,
@@ -1995,9 +2027,10 @@ def main(args):
                     # Compute loss-weights as per Section 3.4 of https://huggingface.co/papers/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
+                    snr = compute_snr(noise_scheduler, timesteps).chunk(2, dim=0)[0]
+                    pred_shape = (timesteps.shape[0] // 2, *timesteps.shape[1:])
                     base_weight = (
-                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                        torch.stack([snr, args.snr_gamma * torch.ones(pred_shape, device=snr.device)], dim=1).min(dim=1)[0] / snr
                     )
 
                     if noise_scheduler.config.prediction_type == "v_prediction":
@@ -2008,6 +2041,7 @@ def main(args):
                         mse_loss_weights = base_weight
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    # print(loss.shape, mse_loss_weights.shape)
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
 

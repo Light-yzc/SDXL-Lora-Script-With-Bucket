@@ -38,3 +38,17 @@
   --seed=42
   # --train_text_encoder \
 ```
+
+---
+## Updates:
+
+ - 25/9/7 fix the proble, of snr that tensor `base_weight` did't match `model_pred`'s shape.
+ - add local multi_tag support, use it by: `--local_config_file_name` and  `--local_config_text_name`
+ like
+ <br>
+ ```bash
+  --local_config_text_name="text" \
+  --output_dir="/content/drive/MyDrive/4_chars/output" \
+ ```
+ <br>
+ - `protential problem:` since I changed the code realated to remote dataset load, so if you load datasets from huggingface, It might not be work, please use local.
