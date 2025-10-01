@@ -1330,7 +1330,6 @@ def main(args):
             unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
-
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         if args.train_text_encoder:
@@ -2027,10 +2026,14 @@ def main(args):
                     # Compute loss-weights as per Section 3.4 of https://huggingface.co/papers/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps).chunk(2, dim=0)[0]
-                    pred_shape = (timesteps.shape[0] // 2, *timesteps.shape[1:])
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    if args.with_prior_preservation:
+                        snr = snr.chunk(2, dim=0)[0]
+
+                    # snr = compute_snr(noise_scheduler, timesteps).chunk(2, dim=0)[0]
+                    # pred_shape = (timesteps.shape[0] // 2, *timesteps.shape[1:])
                     base_weight = (
-                        torch.stack([snr, args.snr_gamma * torch.ones(pred_shape, device=snr.device)], dim=1).min(dim=1)[0] / snr
+                        torch.stack([snr, args.snr_gamma * torch.ones_like(snr)], dim=1).min(dim=1)[0] / snr
                     )
 
                     if noise_scheduler.config.prediction_type == "v_prediction":
